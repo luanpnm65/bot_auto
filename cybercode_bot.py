@@ -3,7 +3,13 @@ import cv2
 import numpy as np
 import time
 import random
-
+import os
+import json
+import math
+import threading
+import ctypes
+from ctypes import wintypes
+import winsound
 # Di chuột nhanh về góc trên cùng bên trái màn hình để dừng khẩn cấp
 pyautogui.FAILSAFE = True
 
@@ -44,980 +50,991 @@ CONFIG = {
 
     "COLOR_TOLERANCE": 30           # Sai số màu sắc cho phép
 }
-import os
-import json
-import math
-import threading
-import ctypes
-from ctypes import wintypes
-import winsound
-
 class RestartBotException(Exception):
-    """Ngoại lệ dùng để ngắt ngay lập tức luồng hiện tại khi bấm F9"""
+    """Ngoại lệ dùng để ngắt ngay lập tức mọi thao tác và Restart lại Bot"""
     pass
 
 
-class CyberCodeDungeonBot:
-    OPPOSITE_DIR = {
-        "TOP": "BOTTOM",
-        "BOTTOM": "TOP",
-        "LEFT": "RIGHT",
-        "RIGHT": "LEFT",
-    }
-    DIR_DELTA = {
-        "TOP": (0, -1),
-        "BOTTOM": (0, 1),
-        "LEFT": (-1, 0),
-        "RIGHT": (1, 0),
-    }
+# Bảng tra cứu hướng cửa ĐỐI DIỆN và vector di chuyển trên bản đồ phòng
+OPPOSITE_DIR = {
+    "TOP": "BOTTOM",
+    "BOTTOM": "TOP",
+    "LEFT": "RIGHT",
+    "RIGHT": "LEFT"
+}
 
+DIR_DELTA = {
+    "TOP": (0, -1),
+    "BOTTOM": (0, 1),
+    "LEFT": (-1, 0),
+    "RIGHT": (1, 0)
+}
+
+
+class CyberCodeDungeonBot:
     def __init__(self, config):
         self.cfg = config
-        self.mode = 1
-        self.dungeon_type = 1
-        self.reselect_mode_next_run = False
-
-        # Trạng thái điều khiển phím nóng
+        self.run_count = 0
         self.paused = False
         self.restart_requested = False
-
-        # Tọa độ nhân vật ước tính trên màn hình
+        
+        # Quản lý Loại Dungeon (1: Normal, 2: Co-op, 3: Gang) & Chế độ Boss (1, 2, 3)
+        self.dungeon_type = 1
+        self.mode = 1
+        self.reselect_mode_next_run = False
         self.player_pos = None
 
-        # Theo dõi hướng cửa & hình học của phòng để không đi lùi về phòng cũ
-        self.room_center = None
-        self.room_pos = (0, 0)
-        self.last_exit_dir = None
-        self.last_exit_coord = None
-        self.edge_visits = {}
+        # Bộ nhớ định hướng bản đồ phòng (Chống đi ngược vào cửa đối diện)
+        self.room_center = None             # Tâm bản đồ phòng (Cx, Cy)
+        self.map_points_history = []        # Lưu các điểm cửa/quái để tính tâm phòng chuẩn
+        self.last_exit_dir = None           # Hướng cửa vừa đi ra ở phòng trước ('TOP', 'BOTTOM', 'LEFT', 'RIGHT')
+        self.last_exit_coord = None         # Tọa độ cửa vừa click ở phòng trước
+        self.room_pos = (0, 0)              # Tọa độ phòng hiện tại trên lưới (rx, ry)
+        self.edge_visits = {}               # Đếm số lần đi qua từng cánh cửa ở mỗi phòng
 
-        # Cấu hình khung cửa sổ (F2)
-        self.window_config_file = "window_config.json"
-        self.base_rect = None
-        self.current_rect = None
-        self.load_window_config()
+        # ==========================================================
+        # HỆ THỐNG QUẢN LÝ TỈ LỆ KHUNG HÌNH (RELATIVE RATIO SYSTEM)
+        # ==========================================================
+        screen_w, screen_h = pyautogui.size()
+        self.calib_file = "window_config.json"
+        
+        self.base_rect = self.cfg.get("BASE_WINDOW_RECT", (0, 0, screen_w, screen_h))
+        self.current_rect = self.base_rect
+        self.game_hwnd = None
 
-        # Khởi chạy luồng lắng nghe phím nóng F1, F2, F8, F9
-        self.hotkey_thread = threading.Thread(target=self._hotkey_listener, daemon=True)
-        self.hotkey_thread.start()
+        self._load_window_calibration()
 
-    # ==========================================
-    # HỆ THỐNG PHÍM NÓNG (F1, F2, F8, F9) & CỬA SỔ
-    # ==========================================
-    def _hotkey_listener(self):
-        VK_F1 = 0x70
-        VK_F2 = 0x71
-        VK_F8 = 0x77
-        VK_F9 = 0x78
+        # Khởi động luồng lắng nghe phím nóng F1, F2, F8, F9
+        listener_thread = threading.Thread(target=self._hotkey_listener, daemon=True)
+        listener_thread.start()
 
-        f1_prev = f2_prev = f8_prev = f9_prev = False
-
-        while True:
-            # F1: Chọn lại chế độ ở lượt sau
-            f1_curr = bool(ctypes.windll.user32.GetAsyncKeyState(VK_F1) & 0x8000)
-            if f1_curr and not f1_prev:
-                self.reselect_mode_next_run = True
-                print("\n[🔔 HOTKEY F1] Đã đăng ký đổi Chế độ vào lượt Dungeon tiếp theo!")
-            f1_prev = f1_curr
-
-            # F2: Đồng bộ / Khóa tỷ lệ cửa sổ
-            f2_curr = bool(ctypes.windll.user32.GetAsyncKeyState(VK_F2) & 0x8000)
-            if f2_curr and not f2_prev:
-                self.calibrate_or_sync_window()
-            f2_prev = f2_curr
-
-            # F8: Tạm dừng / Tiếp tục (để giải mini-game)
-            f8_curr = bool(ctypes.windll.user32.GetAsyncKeyState(VK_F8) & 0x8000)
-            if f8_curr and not f8_prev:
-                self.paused = not self.paused
-                if self.paused:
-                    print("\n[⏸️ HOTKEY F8] ĐÃ TẠM DỪNG BOT! Bạn có thể tự giải mini-game. Bấm F8 lần nữa để tiếp tục...")
-                else:
-                    print("\n[▶️ HOTKEY F8] TIẾP TỤC CHẠY BOT!")
-            f8_prev = f8_curr
-
-            # F9: Khởi động lại luồng bot ngay lập tức
-            f9_curr = bool(ctypes.windll.user32.GetAsyncKeyState(VK_F9) & 0x8000)
-            if f9_curr and not f9_prev:
-                self.paused = False
-                self.restart_requested = True
-                print("\n[🔄 HOTKEY F9] Đang khởi động lại chu trình Bot ngay lập tức...")
-            f9_prev = f9_curr
-
-            time.sleep(0.05)
-
-    def check_control_state(self):
-        """Kiểm tra trạng thái Tạm dừng (F8) hoặc Khởi động lại (F9)"""
-        if self.restart_requested:
-            self.restart_requested = False
-            raise RestartBotException()
-
-        while self.paused:
-            if self.restart_requested:
-                self.restart_requested = False
-                raise RestartBotException()
-            time.sleep(0.2)
-
-    def sleep(self, seconds):
-        """Hàm sleep có kiểm tra F8/F9 liên tục để phản hồi tức thì"""
-        end_time = time.time() + seconds
-        while time.time() < end_time:
-            self.check_control_state()
-            time.sleep(min(0.1, max(0.01, end_time - time.time())))
-
-    def get_active_window_rect(self):
-        hwnd = ctypes.windll.user32.GetForegroundWindow()
-        if not hwnd:
-            return None
-        rect = ctypes.wintypes.RECT()
-        if ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+    # ==========================================================
+    # CÁC HÀM XỬ LÝ TỌA ĐỘ TỈ LỆ & CỬA SỔ GAME (F2)
+    # ==========================================================
+    def _get_active_window_rect(self):
+        try:
+            hwnd = ctypes.windll.user32.GetForegroundWindow()
+            rect = wintypes.RECT()
+            ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
             w = rect.right - rect.left
             h = rect.bottom - rect.top
-            if w > 100 and h > 100:
-                return (rect.left, rect.top, w, h)
-        return None
+            if w > 200 and h > 200:
+                return hwnd, (rect.left, rect.top, w, h)
+        except Exception:
+            pass
+        sw, sh = pyautogui.size()
+        return None, (0, 0, sw, sh)
 
-    def load_window_config(self):
-        if os.path.exists(self.window_config_file):
+    def _load_window_calibration(self):
+        if os.path.exists(self.calib_file):
             try:
-                with open(self.window_config_file, "r", encoding="utf-8") as f:
+                with open(self.calib_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    self.base_rect = tuple(data.get("base_rect"))
+                    self.base_rect = tuple(data["base_rect"])
                     self.current_rect = tuple(data.get("current_rect", self.base_rect))
-                    print(f"[+] Đã tải cấu hình khung cửa sổ gốc: {self.base_rect}")
-            except Exception as e:
-                print(f"[!] Lỗi đọc {self.window_config_file}: {e}")
+                print(f"[*] Đã tải cấu hình tỉ lệ cửa sổ chuẩn: {self.base_rect}")
+            except Exception:
+                pass
 
     def calibrate_or_sync_window(self):
-        rect = self.get_active_window_rect()
-        if not rect:
-            print("[!] Không lấy được kích thước cửa sổ hiện tại!")
-            return
+        hwnd, rect = self._get_active_window_rect()
+        self.game_hwnd = hwnd
 
-        if self.base_rect is None:
+        if not os.path.exists(self.calib_file):
             self.base_rect = rect
             self.current_rect = rect
-            print(f"\n[📐 HOTKEY F2] Đã LƯU KHUNG CỬA SỔ GỐC: {self.base_rect}")
+            with open(self.calib_file, "w", encoding="utf-8") as f:
+                json.dump({"base_rect": self.base_rect, "current_rect": self.current_rect}, f, indent=4)
+            print("\n========================================================")
+            print(f"[📐 ĐÃ LƯU KHUNG CỬA SỔ CHUẨN (F2)]: {self.base_rect}")
+            print("-> Mọi tọa độ của bạn đã được khóa theo TỈ LỆ của cửa sổ này!")
+            self.print_relative_ratios()
+            print("========================================================\n")
         else:
             self.current_rect = rect
-            print(f"\n[📐 HOTKEY F2] Đã ĐỒNG BỘ KHUNG CỬA SỔ MỚI: {self.current_rect} (Gốc: {self.base_rect})")
+            with open(self.calib_file, "w", encoding="utf-8") as f:
+                json.dump({"base_rect": self.base_rect, "current_rect": self.current_rect}, f, indent=4)
+            scale_w = self.current_rect[2] / self.base_rect[2]
+            scale_h = self.current_rect[3] / self.base_rect[3]
+            print("\n========================================================")
+            print(f"[📐 ĐÃ ĐỒNG BỘ VỊ TRÍ CỬA SỔ MỚI (F2)]: {self.current_rect}")
+            print(f"-> Tỉ lệ co giãn so với chuẩn: Ngang {scale_w:.2f}x | Dọc {scale_h:.2f}x")
+            print("========================================================\n")
 
-        try:
-            with open(self.window_config_file, "w", encoding="utf-8") as f:
-                json.dump(
-                    {"base_rect": self.base_rect, "current_rect": self.current_rect},
-                    f,
-                    indent=2,
-                )
-        except Exception as e:
-            print(f"[!] Không thể lưu {self.window_config_file}: {e}")
+    def auto_refresh_window_rect(self):
+        if self.game_hwnd:
+            try:
+                rect = wintypes.RECT()
+                if ctypes.windll.user32.GetWindowRect(self.game_hwnd, ctypes.byref(rect)):
+                    w = rect.right - rect.left
+                    h = rect.bottom - rect.top
+                    if w > 200 and h > 200 and rect.left > -10000:
+                        self.current_rect = (rect.left, rect.top, w, h)
+            except Exception:
+                pass
 
     def get_coord(self, key):
+        """Chuyển đổi tọa độ trong CONFIG sang tọa độ thực tế dựa theo TỈ LỆ cửa sổ"""
+        self.auto_refresh_window_rect()
         raw_x, raw_y = self.cfg[key]
-        if not self.base_rect or not self.current_rect:
-            return (raw_x, raw_y)
+        base_l, base_t, base_w, base_h = self.base_rect
+        cur_l, cur_t, cur_w, cur_h = self.current_rect
 
-        bx, by, bw, bh = self.base_rect
-        cx, cy, cw, ch = self.current_rect
-        if bw <= 0 or bh <= 0:
-            return (raw_x, raw_y)
-
-        rel_x = (raw_x - bx) / float(bw)
-        rel_y = (raw_y - by) / float(bh)
-
-        new_x = int(round(cx + rel_x * cw))
-        new_y = int(round(cy + rel_y * ch))
-        return (new_x, new_y)
-
-    # ==========================================
-    # CHỌN CHẾ ĐỘ CHẠY (1, 2, 3, 4)
-    # ==========================================
-    def select_mode(self):
-        print("\n" + "=" * 65)
-        print("            CÀI ĐẶT CHẾ ĐỘ CHẠY BOT CYBERCODE")
-        print("=" * 65)
-        print("BƯỚC 1 - CHỌN LOẠI DUNGEON:")
-        print("  [1] Dungeon Thường (Normal)")
-        print("  [2] Dungeon Co-op")
-        print("  [3] Dungeon Gang")
-        print("-" * 65)
-
-        while True:
-            d_choice = input("👉 Nhập loại Dungeon (1, 2 hoặc 3): ").strip()
-            if d_choice in ["1", "2", "3"]:
-                self.dungeon_type = int(d_choice)
-                break
-            print("[!] Lựa chọn không hợp lệ! Vui lòng nhập 1, 2 hoặc 3.")
-
-        print("\n" + "-" * 65)
-        print("BƯỚC 2 - CHỌN CHẾ ĐỘ ĐÁNH DUNGEON & PHÒNG BOSS (> 4 quái):")
-        print("  [1] Chế độ 1: Clear hết quái trong phòng Boss rồi Thoát.")
-        print("  [2] Chế độ 2: Chỉ giết Boss (quái bắn > 6 phát), nhặt đồ rồi Thoát luôn.")
-        print("  [3] Chế độ 3: Clear hết quái phòng Boss + Mở hết hòm đồ (loot.png) rồi Thoát.")
-        print("  [4] Chế độ 4 (FARM NHANH): Luôn bắn súng Y (oneshot, bỏ qua giáp) & Thoát khi clear phòng Boss.")
-        print("=" * 65)
-
-        while True:
-            choice = input("👉 Nhập chế độ bạn muốn chạy (1, 2, 3 hoặc 4): ").strip()
-            if choice in ["1", "2", "3", "4"]:
-                self.mode = int(choice)
-                d_names = {1: "Thường (Normal)", 2: "Co-op", 3: "Gang"}
-                print(
-                    f"[+] Đã chọn: Dungeon {d_names[self.dungeon_type]} | Chế độ {self.mode}\n"
-                )
-                self.reselect_mode_next_run = False
-                break
-            print("[!] Lựa chọn không hợp lệ! Vui lòng nhập 1, 2, 3 hoặc 4.")
-
-    # ==========================================
-    # CÁC HÀM XỬ LÝ HÌNH ẢNH & MÀU SẮC
-    # ==========================================
-    def capture_screen(self):
-        screenshot = pyautogui.screenshot()
-        return cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
-
-    def find_all_objects(self, template_path, confidence=None, screen_bgr=None):
-        if confidence is None:
-            confidence = self.cfg["CONFIDENCE"]
-
-        if not os.path.exists(template_path):
-            return []
-
-        if screen_bgr is None:
-            screen_bgr = self.capture_screen()
-
-        template = cv2.imread(template_path, cv2.IMREAD_COLOR)
-        if template is None:
-            return []
-
-        orig_h, orig_w = template.shape[:2]
-        screen_h, screen_w = screen_bgr.shape[:2]
-
-        # Quét ở nhiều tỷ lệ đồng nhất (không làm méo ảnh trên Web)
-        scales = [1.0, 0.9, 1.1, 0.8, 1.2]
-        candidates = []  # Lưu (độ_chính_xác, cx, cy)
-
-        for s in scales:
-            th = max(5, int(round(orig_h * s)))
-            tw = max(5, int(round(orig_w * s)))
-            if th >= screen_h or tw >= screen_w:
-                continue
-
-            if s == 1.0:
-                scaled_tpl = template
-            else:
-                interp = cv2.INTER_AREA if s < 1.0 else cv2.INTER_LINEAR
-                scaled_tpl = cv2.resize(template, (tw, th), interpolation=interp)
-
-            result = cv2.matchTemplate(screen_bgr, scaled_tpl, cv2.TM_CCOEFF_NORMED)
-            ys, xs = np.where(result >= confidence)
-
-            for y, x in zip(ys, xs):
-                score = float(result[y, x])
-                cx = int(x + tw // 2)
-                cy = int(y + th // 2)
-                candidates.append((score, cx, cy))
-
-            if s == 1.0 and len(candidates) > 0:
-                break
-
-        if not candidates:
-            return []
-
-        # Ưu tiên giữ lại điểm có độ khớp cao nhất và lọc bỏ các điểm trùng trong bán kính 20px
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        centers = []
-        for _, cx, cy in candidates:
-            if not any(math.hypot(cx - ex, cy - ey) < 20 for (ex, ey) in centers):
-                centers.append((cx, cy))
-
-        return centers
-
-    def find_single_object(self, template_path, confidence=None):
-        matches = self.find_all_objects(template_path, confidence)
-        return matches[0] if matches else None
-
-    def click(self, coord, delay=0.5):
-        self.check_control_state()
-        if coord is not None:
-            pyautogui.click(coord[0], coord[1])
-            self.sleep(delay)
-
-    def wait_and_click(self, template_path, timeout=10, delay=0.8):
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            self.check_control_state()
-            pos = self.find_single_object(template_path)
-            if pos:
-                self.click(pos, delay=delay)
-                return True
-            self.sleep(0.4)
-        print(f"[!] Quá thời gian chờ ảnh: {template_path}")
-        return False
-
-    def get_pixel_rgb(self, coord):
-        x, y = int(coord[0]), int(coord[1])
-        bgr = self.capture_screen()[y, x]
-        return (int(bgr[2]), int(bgr[1]), int(bgr[0]))
-
-    def check_pixel_color(self, coord, target_rgb, tolerance=None):
-        if tolerance is None:
-            tolerance = self.cfg["COLOR_TOLERANCE"]
-        r, g, b = self.get_pixel_rgb(coord)
-        tr, tg, tb = target_rgb
-        return (
-            abs(r - tr) <= tolerance
-            and abs(g - tg) <= tolerance
-            and abs(b - tb) <= tolerance
-        )
-
-    # ==========================================
-    # KIỂM TRA MÁU, GIÁP & DI CHUYỂN
-    # ==========================================
-    def is_hp_bar_visible(self):
-        hp_start = self.get_coord("COORD_HP_START")
-        return self.check_pixel_color(hp_start, self.cfg["COLOR_HP_RED"], tolerance=45)
-
-    def need_healing(self):
-        """
-        Kiểm tra điểm Z trên thanh máu có còn màu đỏ hay không.
-        Quét 3 điểm lân cận ngang để tránh chữ đè lên thanh máu.
-        """
-        zx, zy = self.get_coord("COORD_HP_Z")
-        start_rgb = self.get_pixel_rgb(self.get_coord("COORD_HP_START"))
-        target_red = self.cfg["COLOR_HP_RED"]
-
-        for dx in (0, -3, 3):
-            r, g, b = self.get_pixel_rgb((zx + dx, zy))
-            # Nếu sắc đỏ nổi bật
-            if r > 100 and (r > g + 40) and (r > b + 40):
-                return False
-            # Hoặc giống màu tại điểm đầu thanh máu
-            if (
-                abs(r - start_rgb[0]) <= 45
-                and abs(g - start_rgb[1]) <= 45
-                and abs(b - start_rgb[2]) <= 45
-            ):
-                return False
-            # Hoặc khớp với COLOR_HP_RED
-            if (
-                abs(r - target_red[0]) <= 45
-                and abs(g - target_red[1]) <= 45
-                and abs(b - target_red[2]) <= 45
-            ):
-                return False
-
-        return True
-
-    def has_shield(self):
-        shield_coord = self.get_coord("COORD_SHIELD")
-        return self.check_pixel_color(shield_coord, self.cfg["COLOR_SHIELD"])
-
-    def has_character_moved(self, screen_before, screen_after, diff_threshold=1500):
-        gray1 = cv2.cvtColor(screen_before, cv2.COLOR_BGR2GRAY)
-        gray2 = cv2.cvtColor(screen_after, cv2.COLOR_BGR2GRAY)
-        diff = cv2.absdiff(gray1, gray2)
-        _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
-        changed_pixels = cv2.countNonZero(thresh)
-        return changed_pixels > diff_threshold
-
-    def get_player_position(self, screen_bgr=None):
-        if os.path.exists(self.cfg["IMG_PLAYER"]):
-            pos = self.find_single_object(self.cfg["IMG_PLAYER"], confidence=0.75)
-            if pos:
-                self.player_pos = pos
-                return pos
-
-        if self.player_pos is not None:
-            return self.player_pos
-
-        if screen_bgr is None:
-            screen_bgr = self.capture_screen()
-        h, w = screen_bgr.shape[:2]
-        return (w // 2, h // 2)
-
-    def sort_by_distance_to_player(self, points, screen_bgr=None):
-        if not points:
-            return []
-        px, py = self.get_player_position(screen_bgr)
-        return sorted(points, key=lambda pt: math.hypot(pt[0] - px, pt[1] - py))
-
-    # ==========================================
-    # PHÂN LOẠI CỬA TRẮNG / XÁM & ĐỊNH HƯỚNG PHÒNG
-    # ==========================================
-    def classify_doors(self, screen_bgr=None):
-        if screen_bgr is None:
-            screen_bgr = self.capture_screen()
-
-        candidates = []
-        # Hạ ngưỡng xuống 0.68 để không bỏ sót cửa xám mờ khi phòng đã hết quái
-        for img_key in ("IMG_DOOR_WHITE", "IMG_DOOR_GREY"):
-            path = self.cfg[img_key]
-            if os.path.exists(path):
-                pts = self.find_all_objects(path, confidence=0.68, screen_bgr=screen_bgr)
-                for pt in pts:
-                    if not any(math.hypot(pt[0] - cx, pt[1] - cy) < 25 for (cx, cy) in candidates):
-                        candidates.append(pt)
-
-        if not candidates:
-            return [], []
-
-        w_tpl = cv2.imread(self.cfg["IMG_DOOR_WHITE"], cv2.IMREAD_GRAYSCALE)
-        g_tpl = cv2.imread(self.cfg["IMG_DOOR_GREY"], cv2.IMREAD_GRAYSCALE)
-
-        if w_tpl is not None and g_tpl is not None:
-            w_mean = float(np.mean(w_tpl))
-            g_mean = float(np.mean(g_tpl))
-            brightness_threshold = (w_mean + g_mean) / 2.0
-            ph, pw = w_tpl.shape[:2]
+        if isinstance(raw_x, float) and isinstance(raw_y, float) and raw_x <= 1.0 and raw_y <= 1.0:
+            ratio_x, ratio_y = raw_x, raw_y
         else:
-            brightness_threshold = 125.0
-            ph, pw = 24, 24
+            ratio_x = (raw_x - base_l) / float(base_w)
+            ratio_y = (raw_y - base_t) / float(base_h)
 
-        gray_screen = cv2.cvtColor(screen_bgr, cv2.COLOR_BGR2GRAY)
-        sh, sw = gray_screen.shape[:2]
+        real_x = int(cur_l + ratio_x * cur_w)
+        real_y = int(cur_t + ratio_y * cur_h)
+        return (real_x, real_y)
 
-        white_doors = []
-        grey_doors = []
+    def print_relative_ratios(self):
+        base_l, base_t, base_w, base_h = self.base_rect
+        print("--- BẢNG TỌA ĐỘ TỈ LỆ TƯƠNG ĐỐI CỦA BẠN ---")
+        coord_keys = [
+            "COORD_DUNGEON_NORMAL", "COORD_DUNGEON_COOP", "COORD_DUNGEON_GANG",
+            "COORD_HP_START", "COORD_HP_Z", "COORD_SHIELD",
+            "COORD_GUN_X", "COORD_GUN_Y", "COORD_HEAL_A", "COORD_LOOT_B"
+        ]
+        for k in coord_keys:
+            if k in self.cfg:
+                rx, ry = self.cfg[k]
+                if rx > 1.0 or ry > 1.0:
+                    rx = round((rx - base_l) / float(base_w), 4)
+                    ry = round((ry - base_t) / float(base_h), 4)
+                print(f'    "{k}": ({rx}, {ry}),')
 
-        for (cx, cy) in candidates:
-            x1 = max(0, cx - pw // 2)
-            y1 = max(0, cy - ph // 2)
-            x2 = min(sw, cx + pw // 2)
-            y2 = min(sh, cy + ph // 2)
-            patch = gray_screen[y1:y2, x1:x2]
-            if patch.size == 0:
-                continue
-
-            patch_brightness = float(np.mean(patch))
-            if patch_brightness >= brightness_threshold:
-                white_doors.append((cx, cy))
-            else:
-                grey_doors.append((cx, cy))
-
-        return white_doors, grey_doors
-
+    # ==========================================================
+    # HỆ THỐNG ĐỊNH HƯỚNG CỬA & TÍNH TỌA ĐỘ ĐỐI DIỆN
+    # ==========================================================
     def update_room_geometry(self, white_doors, grey_doors, monsters):
-        """Ước tính tâm của khung bản đồ phòng để xác định hướng TOP/BOTTOM/LEFT/RIGHT"""
+        """
+        Tự động xác định Tâm Bản Đồ Phòng (Cx, Cy) từ vị trí các cánh cửa và quái vật.
+        Đặc biệt: Khi vừa đi từ Cửa Trắng phòng trước sang phòng mới (chỉ có 1 Cửa Xám đối diện),
+        trung điểm của 2 cửa đó chính là Tâm Phòng chính xác tuyệt đối!
+        """
         all_doors = white_doors + grey_doors
+        for pt in all_doors + monsters:
+            self.map_points_history.append(pt)
 
-        # Nếu vừa đi qua 1 cửa sang phòng mới và phòng mới có đúng 1 cửa xám (cửa vào)
+        # Trường hợp chuẩn xác 100%: Vừa đi qua 1 cửa ở phòng cũ và phòng mới chỉ có đúng 1 Cửa Xám (cửa vừa bước vào)
         if self.last_exit_coord is not None and len(grey_doors) == 1:
-            gx, gy = grey_doors[0]
-            lx, ly = self.last_exit_coord
-            if math.hypot(gx - lx, gy - ly) > 80:
-                self.room_center = ((gx + lx) / 2.0, (gy + ly) / 2.0)
+            g_door = grey_doors[0]
+            dist = math.hypot(g_door[0] - self.last_exit_coord[0], g_door[1] - self.last_exit_coord[1])
+            if dist > 80:  # Hai cửa nằm ở 2 bức tường đối diện nhau
+                cx = (self.last_exit_coord[0] + g_door[0]) // 2
+                cy = (self.last_exit_coord[1] + g_door[1]) // 2
+                self.room_center = (cx, cy)
                 return
 
+        # Trường hợp tìm thấy 2 cửa đối diện nhau theo trục dọc (TOP - BOTTOM) hoặc trục ngang (LEFT - RIGHT)
+        doors_history = [p for p in self.map_points_history]
         if len(all_doors) >= 2:
-            xs = [p[0] for p in all_doors]
-            ys = [p[1] for p in all_doors]
-            span_x = max(xs) - min(xs)
-            span_y = max(ys) - min(ys)
+            for i in range(len(all_doors)):
+                for j in range(i + 1, len(all_doors)):
+                    d1, d2 = all_doors[i], all_doors[j]
+                    # Cùng trục X (lệch nhau < 45px), cách xa nhau theo trục Y (> 120px) -> Cặp cửa TRÊN - DƯỚI
+                    if abs(d1[0] - d2[0]) < 45 and abs(d1[1] - d2[1]) > 120:
+                        self.room_center = ((d1[0] + d2[0]) // 2, (d1[1] + d2[1]) // 2)
+                        return
+                    # Cùng trục Y (lệch nhau < 45px), cách xa nhau theo trục X (> 120px) -> Cặp cửa TRÁI - PHẢI
+                    if abs(d1[1] - d2[1]) < 45 and abs(d1[0] - d2[0]) > 120:
+                        self.room_center = ((d1[0] + d2[0]) // 2, (d1[1] + d2[1]) // 2)
+                        return
 
-            cx, cy = (
-                self.room_center
-                if self.room_center is not None
-                else (sum(xs) / len(xs), sum(ys) / len(ys))
-            )
-            if span_x > 160:
-                cx = (min(xs) + max(xs)) / 2.0
-            if span_y > 160:
-                cy = (min(ys) + max(ys)) / 2.0
-            self.room_center = (cx, cy)
-            return
-
-        if self.room_center is None:
-            pts = all_doors + monsters
-            if pts:
-                xs = [p[0] for p in pts]
-                ys = [p[1] for p in pts]
-                self.room_center = (sum(xs) / len(xs), sum(ys) / len(ys))
-            else:
-                screen = self.capture_screen()
-                h, w = screen.shape[:2]
-                self.room_center = (w / 2.0, h / 2.0)
+        # Dự phòng: Tính tâm từ khung bao (Bounding Box) của tất cả các cửa và quái đã thấy
+        if self.room_center is None and self.map_points_history:
+            xs = [p[0] for p in self.map_points_history]
+            ys = [p[1] for p in self.map_points_history]
+            self.room_center = ((min(xs) + max(xs)) // 2, (min(ys) + max(ys)) // 2)
 
     def get_door_direction(self, door_coord):
+        """Xác định cánh cửa nằm ở hướng nào ('TOP', 'BOTTOM', 'LEFT', 'RIGHT') so với tâm phòng"""
         if self.room_center is None:
-            screen = self.capture_screen()
-            h, w = screen.shape[:2]
-            cx, cy = w / 2.0, h / 2.0
+            self.auto_refresh_window_rect()
+            l, t, w, h = self.current_rect
+            cx, cy = l + w // 2, t + h // 2
         else:
             cx, cy = self.room_center
 
         dx = door_coord[0] - cx
         dy = door_coord[1] - cy
+
         if abs(dx) > abs(dy):
             return "RIGHT" if dx > 0 else "LEFT"
         else:
             return "BOTTOM" if dy > 0 else "TOP"
 
-    def get_opposite_coord(self, coord):
-        if self.room_center is None or coord is None:
-            return coord
+    def get_opposite_coord(self, door_coord):
+        """Tính tọa độ cửa đối diện (nơi nhân vật xuất hiện khi bước sang phòng mới)"""
+        if self.room_center is None:
+            return door_coord
         cx, cy = self.room_center
-        return (int(round(2 * cx - coord[0])), int(round(2 * cy - coord[1])))
+        return (int(2 * cx - door_coord[0]), int(2 * cy - door_coord[1]))
 
     def record_door_transition(self, chosen_door):
+        """Ghi nhớ hướng cửa vừa bước vào để sang phòng sau biết cửa ĐỐI DIỆN là cửa vừa chui ra"""
         direction = self.get_door_direction(chosen_door)
-        rx, ry = self.room_pos
-        edge_key = (rx, ry, direction)
+        
+        # Ghi nhận số lần đi qua cánh cửa này tại phòng hiện tại
+        edge_key = (self.room_pos[0], self.room_pos[1], direction)
         self.edge_visits[edge_key] = self.edge_visits.get(edge_key, 0) + 1
 
-        dx, dy = self.DIR_DELTA[direction]
-        self.room_pos = (rx + dx, ry + dy)
+        # Cập nhật tọa độ phòng mới trên lưới
+        dx, dy = DIR_DELTA[direction]
+        self.room_pos = (self.room_pos[0] + dx, self.room_pos[1] + dy)
+
+        # Lưu lại hướng và tọa độ cửa vừa đi
         self.last_exit_dir = direction
         self.last_exit_coord = chosen_door
+
+        # Khi sang phòng mới, nhân vật sẽ đứng ở CỬA ĐỐI DIỆN với cửa vừa bấm!
         self.player_pos = self.get_opposite_coord(chosen_door)
+        return direction
 
     def choose_best_grey_door(self, grey_doors):
         """
-        Chọn cửa xám tối ưu:
-        - Nếu chỉ có 1 cửa xám (ngõ cụt): đi qua cửa đó để quay lại.
-        - Nếu có >= 2 cửa xám: Loại bỏ cửa nằm ở HƯỚNG NGƯỢC LẠI với cửa vừa đi ra ở phòng trước
-          (vì cửa ngược hướng chính là cửa dẫn lùi về phòng vừa đứng).
-        - Cho phép đi thẳng qua cửa xám trùng tọa độ/cùng hướng với cửa phòng trước.
+        Chọn Cửa Xám thông minh khi phòng không còn Cửa Trắng:
+        1. Nếu chỉ có 1 Cửa Xám (phòng cụt) -> Bắt buộc đi cửa đó để quay lại.
+        2. Nếu có >= 2 Cửa Xám -> LOẠI BỎ CỬA ĐỐI DIỆN với cửa vừa đi ở phòng trước
+           (vì cửa đối diện chính là cửa dẫn ngược về phòng vừa mới rời đi!).
+        3. Lưu ý: Nếu phòng mới có cửa xám nằm TRÙNG TỌA ĐỘ (cùng hướng) với cửa phòng cũ,
+           nó là cửa đi thẳng sang phòng tiếp theo nên ĐƯỢC PHÉP ĐI!
         """
-        if not grey_doors:
-            return None
         if len(grey_doors) == 1:
-            return grey_doors[0]
+            only_door = grey_doors[0]
+            d_dir = self.get_door_direction(only_door)
+            print(f"   [*] Phòng cụt (chỉ có 1 Cửa Xám ở hướng {d_dir}) -> Đi ngược lại đường cũ.")
+            return only_door
 
-        came_from_dir = self.OPPOSITE_DIR.get(self.last_exit_dir) if self.last_exit_dir else None
-        expected_back_coord = (
-            self.get_opposite_coord(self.last_exit_coord) if self.last_exit_coord else None
-        )
+        # Hướng cửa mà nhân vật vừa bước ra khi vào phòng này chính là HƯỚNG ĐỐI DIỆN với hướng đi ở phòng trước
+        came_from_dir = OPPOSITE_DIR.get(self.last_exit_dir) if self.last_exit_dir else None
+        expected_back_coord = self.get_opposite_coord(self.last_exit_coord) if self.last_exit_coord else None
 
         candidates = []
         for d in grey_doors:
             d_dir = self.get_door_direction(d)
-            if came_from_dir and d_dir == came_from_dir:
+            
+            # Kiểm tra xem cửa này có phải là cửa ĐỐI DIỆN (cửa vừa bước vào phòng) hay không
+            is_opposite_direction = (came_from_dir is not None and d_dir == came_from_dir)
+            
+            # Kiểm tra khoảng cách tới tọa độ đối xứng qua tâm phòng
+            is_near_opposite_coord = (
+                expected_back_coord is not None and
+                math.hypot(d[0] - expected_back_coord[0], d[1] - expected_back_coord[1]) < 65
+            )
+
+            # Kiểm tra phụ: Cửa vừa bước ra luôn là cửa nằm XA NHẤT so với tọa độ cửa vừa click ở phòng cũ
+            if is_opposite_direction or is_near_opposite_coord:
+                print(f"   [Né cửa] Bỏ qua Cửa Xám tại {d} (Hướng {d_dir}) vì đây là cửa ĐỐI DIỆN dẫn ngược về phòng cũ!")
                 continue
-            if expected_back_coord and math.hypot(d[0] - expected_back_coord[0], d[1] - expected_back_coord[1]) < 65:
-                continue
+
             candidates.append(d)
 
-        # Fallback nếu lọc quá tay: loại bỏ cửa xa nhất so với cửa vừa bước ra (tức là cửa đối diện)
-        if not candidates and self.last_exit_coord is not None:
+        # Dự phòng nếu chưa có tâm phòng chuẩn làm lọc hết hoặc chưa lọc được:
+        # Cửa dẫn ngược về phòng cũ luôn là cửa có khoảng cách XA NHẤT so với last_exit_coord!
+        if len(candidates) == len(grey_doors) and self.last_exit_coord is not None:
             farthest_door = max(
                 grey_doors,
-                key=lambda d: math.hypot(d[0] - self.last_exit_coord[0], d[1] - self.last_exit_coord[1]),
+                key=lambda d: math.hypot(d[0] - self.last_exit_coord[0], d[1] - self.last_exit_coord[1])
             )
             candidates = [d for d in grey_doors if d != farthest_door]
+            print(f"   [Né cửa] Đã loại bỏ cửa đối diện xa nhất {farthest_door} để không quay lại phòng cũ!")
 
         if not candidates:
-            candidates = list(grey_doors)
+            candidates = grey_doors
 
-        rx, ry = self.room_pos
-        candidates.sort(
-            key=lambda d: self.edge_visits.get((rx, ry, self.get_door_direction(d)), 0)
-        )
-        return candidates[0]
+        # Nếu vẫn còn nhiều hơn 1 cửa xám hợp lệ (ngã 3, ngã 4), ưu tiên chọn cửa ÍT ĐI QUA NHẤT
+        def door_priority(d):
+            d_dir = self.get_door_direction(d)
+            visits = self.edge_visits.get((self.room_pos[0], self.room_pos[1], d_dir), 0)
+            return visits
 
-    # ==========================================
-    # CHIẾN ĐẤU & NHẶT ĐỒ SAU TRẬN
-    # ==========================================
-    
+        candidates.sort(key=door_priority)
+        chosen = candidates[0]
+        print(f"   [Chọn hướng] Quyết định đi Cửa Xám hướng [{self.get_door_direction(chosen)}] tại {chosen}.")
+        return chosen
 
-    def combat_loop(self):
-        print("    [⚔️] Bắt đầu giao chiến...")
-        shots_fired = 0
-        shot_cooldown = self.cfg.get("SHOT_COOLDOWN", 2.2)  # Thời gian giữa 2 phát bắn thực tế
+    # ==========================================================
+    # LUỒNG PHÍM NÓNG (F1, F2, F8, F9)
+    # ==========================================================
+    def _hotkey_listener(self):
+        VK_F1 = 0x70
+        VK_F2 = 0x71
+        VK_F8 = 0x77
+        VK_F9 = 0x78
+        while True:
+            if ctypes.windll.user32.GetAsyncKeyState(VK_F1) & 0x8000:
+                self.reselect_mode_next_run = True
+                winsound.Beep(900, 200)
+                print("\n[🔔 ĐÃ NHẤN F1] Sẽ hiển thị bảng chọn lại Loại Dungeon & Chế Độ ở lượt kế tiếp!\n")
+                time.sleep(0.5)
 
-        while self.is_hp_bar_visible():
-            self.check_control_state()
+            if ctypes.windll.user32.GetAsyncKeyState(VK_F2) & 0x8000:
+                winsound.Beep(1100, 200)
+                self.calibrate_or_sync_window()
+                time.sleep(0.5)
 
-            # 1. Kiểm tra điểm Z trên thanh máu trước mỗi phát bắn
-            if self.need_healing():
-                print("    [❤️] Máu tụt dưới điểm Z! Bấm hồi máu tại A...")
-                self.click(self.get_coord("COORD_HEAL_A"), delay=0.8)
-                continue
-
-            # 2. Chọn súng và bắn
-            if self.mode == 4:
-                # Chế độ 4 (Farm oneshot): Bỏ qua kiểm tra giáp, luôn bắn súng Y
-                print(f"    [🔫] (Farm Mode 4) Bắn súng Y (Phát thứ {shots_fired + 1})")
-                self.click(self.get_coord("COORD_GUN_Y"), delay=0.2)
-            else:
-                # Chế độ 1, 2, 3: Kiểm tra giáp để chọn súng X hoặc Y
-                if self.has_shield():
-                    print(f"    [🛡️] Quái CÓ GIÁP -> Bắn súng X (Phát thứ {shots_fired + 1})")
-                    self.click(self.get_coord("COORD_GUN_X"), delay=0.2)
+            if ctypes.windll.user32.GetAsyncKeyState(VK_F8) & 0x8000:
+                self.paused = not self.paused
+                if self.paused:
+                    winsound.Beep(600, 300)
+                    print("\n========================================================")
+                    print("[⏸ TẠM DỪNG AUTO] Đã nhả chuột để bạn giải Mini-game!")
+                    print("-> [F8]: Tiếp tục | [F9]: Restart | [F1]: Đổi Mode | [F2]: Đồng bộ cửa sổ")
+                    print("========================================================\n")
                 else:
-                    print(f"    [🎯] Quái KHÔNG GIÁP -> Bắn súng Y (Phát thứ {shots_fired + 1})")
-                    self.click(self.get_coord("COORD_GUN_Y"), delay=0.2)
+                    winsound.Beep(1000, 150)
+                    winsound.Beep(1200, 150)
+                    print("\n[▶ TIẾP TỤC AUTO] Bot đang hoạt động trở lại!\n")
+                time.sleep(0.5)
 
-            shots_fired += 1
+            if ctypes.windll.user32.GetAsyncKeyState(VK_F9) & 0x8000:
+                winsound.Beep(800, 150)
+                winsound.Beep(1000, 150)
+                winsound.Beep(1400, 200)
+                print("\n[🔄 RESTART AUTO] Đang khởi động lại chu trình Auto...\n")
+                self.paused = False
+                self.restart_requested = True
+                time.sleep(0.5)
 
-            # 3. Chờ animation đòn bắn (tối thiểu 1.0s đầu cho đòn đánh thực thi)
-            self.sleep(1.0)
+            time.sleep(0.05)
 
-            # Trong phần thời gian hồi chiêu còn lại, nếu quái đã chết (thanh máu tắt) thì thoát ngay
-            wait_end = time.time() + max(0.2, shot_cooldown - 1.0)
-            while time.time() < wait_end:
-                self.check_control_state()
-                if not self.is_hp_bar_visible():
-                    break
-                self.sleep(0.2)
+    def select_mode(self):
+        print("\n========================================================")
+        print("        BƯỚC A: CHỌN LOẠI DUNGEON (NORMAL / CO-OP / GANG)")
+        print("========================================================")
+        print(" [1] Normal Dungeon (Click tọa độ 1: COORD_DUNGEON_NORMAL)")
+        print(" [2] Co-op Dungeon  (Click tọa độ 2: COORD_DUNGEON_COOP)")
+        print(" [3] Gang Dungeon   (Click tọa độ 3: COORD_DUNGEON_GANG)")
+        print("========================================================")
+        while True:
+            d_choice = input("-> Nhập Loại Dungeon muốn đi (1, 2 hoặc 3) rồi nhấn Enter: ").strip()
+            if d_choice in ["1", "2", "3"]:
+                self.dungeon_type = int(d_choice)
+                break
+            print("   [!] Vui lòng chỉ nhập 1, 2 hoặc 3.")
 
-        print(f"    [✓] Quái đã chết sau {shots_fired} phát bắn!")
-        self.handle_post_combat_loot()
-        return shots_fired
+        print("\n========================================================")
+        print("        BƯỚC B: CHỌN CHẾ ĐỘ ĐÁNH PHÒNG BOSS (1 / 2 / 3) ")
+        print("========================================================")
+        print(" [1] Chế độ 1: Clear sạch quái phòng Boss (> 4 quái) rồi thoát.")
+        print(" [2] Chế độ 2: Chỉ Kill Boss (Quái bắn > 6 phát mới chết) rồi thoát ngay.")
+        print(" [3] Chế độ 3: Clear sạch quái phòng Boss + Loot hết đồ (loot.png) rồi thoát.")
+        print("========================================================")
+        while True:
+            m_choice = input("-> Nhập Chế độ đánh Boss (1, 2 hoặc 3) rồi nhấn Enter: ").strip()
+            if m_choice in ["1", "2", "3"]:
+                self.mode = int(m_choice)
+                self.reselect_mode_next_run = False
+                break
+            print("   [!] Vui lòng chỉ nhập 1, 2 hoặc 3.")
 
-    # ==========================================
-    # DỌN PHÒNG, MỞ HÒM LOOT & THOÁT DUNGEON
-    # ==========================================
-    def is_room_map_visible(self, screen_bgr=None):
-        """Kiểm tra xem bản đồ phòng (quái, cửa trắng/xám, hoặc hòm loot) đã hiện ra chưa"""
-        if screen_bgr is None:
-            screen_bgr = self.capture_screen()
+        dungeon_names = {1: "NORMAL", 2: "CO-OP", 3: "GANG"}
+        print(f"\n[✔] Đã chọn: Dungeon [{dungeon_names[self.dungeon_type]}] - Chế độ Boss [{self.mode}]!")
+        print("-> Hãy CLICK VÀO CỬA SỔ GAME trong 3 giây tới...")
+        time.sleep(3)
+        hwnd, _ = self._get_active_window_rect()
+        if hwnd and os.path.exists(self.calib_file):
+            self.game_hwnd = hwnd
+            self.auto_refresh_window_rect()
 
-        monsters = self.find_all_objects(self.cfg["IMG_MONSTER"], screen_bgr=screen_bgr)
-        if len(monsters) > 0:
+    def click_selected_dungeon_type(self):
+        type_map = {
+            1: ("NORMAL", "COORD_DUNGEON_NORMAL"),
+            2: ("CO-OP", "COORD_DUNGEON_COOP"),
+            3: ("GANG", "COORD_DUNGEON_GANG")
+        }
+        d_name, coord_key = type_map.get(self.dungeon_type, ("NORMAL", "COORD_DUNGEON_NORMAL"))
+        
+        if coord_key not in self.cfg:
+            print(f"[Lỗi] Bạn chưa khai báo '{coord_key}' trong phần CONFIG!")
+            return False
+
+        target_coord = self.get_coord(coord_key)
+        print(f"[Bước 2] Chọn loại Dungeon [{d_name}] -> Click tọa độ {target_coord}...")
+        self.safe_click(*target_coord)
+        self.random_delay(0.8, 1.4)
+        return True
+
+    def check_control_state(self):
+        if self.restart_requested:
+            raise RestartBotException()
+        while self.paused:
+            if self.restart_requested:
+                raise RestartBotException()
+            time.sleep(0.2)
+
+    def random_delay(self, min_sec=0.5, max_sec=1.5):
+        total_delay = random.uniform(min_sec, max_sec)
+        elapsed = 0.0
+        while elapsed < total_delay:
+            self.check_control_state()
+            time.sleep(0.1)
+            elapsed += 0.1
+
+    def safe_click(self, x, y):
+        self.check_control_state()
+        offset_x = random.randint(-3, 3)
+        offset_y = random.randint(-3, 3)
+        pyautogui.moveTo(int(x) + offset_x, int(y) + offset_y, duration=random.uniform(0.1, 0.25))
+        self.check_control_state()
+        pyautogui.click()
+
+    def get_screen_bgr(self):
+        screenshot = pyautogui.screenshot()
+        return cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
+
+    def check_pixel_color(self, coord, target_rgb):
+        try:
+            current_rgb = pyautogui.pixel(int(coord[0]), int(coord[1]))
+            tol = self.cfg["COLOR_TOLERANCE"]
+            return all(abs(current_rgb[i] - target_rgb[i]) <= tol for i in range(3))
+        except Exception as e:
+            print(f"[Lỗi đọc Pixel] {e}")
+            return False
+
+    def is_red_hp_at(self, coord):
+        try:
+            x, y = int(coord[0]), int(coord[1])
+            target_r, target_g, target_b = self.cfg["COLOR_HP_RED"]
+            tol = self.cfg["COLOR_TOLERANCE"]
+
+            for dx in [0, -3, 3]:
+                r, g, b = pyautogui.pixel(x + dx, y)
+                match_config = (abs(r - target_r) <= tol and abs(g - target_g) <= tol and abs(b - target_b) <= tol)
+                is_red_dominant = (r > 100 and r > g + 40 and r > b + 40)
+                if match_config or is_red_dominant:
+                    return True
+            return False
+        except Exception:
+            return False
+
+    def is_hp_bar_visible(self):
+        return self.is_red_hp_at(self.get_coord("COORD_HP_START"))
+
+    def is_hp_above_z(self):
+        coord_z = self.get_coord("COORD_HP_Z")
+        coord_start = self.get_coord("COORD_HP_START")
+        if self.is_red_hp_at(coord_z):
             return True
-
-        white_doors, grey_doors = self.classify_doors(screen_bgr=screen_bgr)
-        if len(white_doors) > 0 or len(grey_doors) > 0:
-            return True
-
-        if os.path.exists(self.cfg["IMG_LOOT"]):
-            loots = self.find_all_objects(self.cfg["IMG_LOOT"], screen_bgr=screen_bgr)
-            if len(loots) > 0:
+        try:
+            start_rgb = pyautogui.pixel(*coord_start)
+            z_rgb = pyautogui.pixel(*coord_z)
+            tol = self.cfg["COLOR_TOLERANCE"]
+            if all(abs(start_rgb[i] - z_rgb[i]) <= tol for i in range(3)):
                 return True
+        except Exception:
+            pass
+        return False
 
+    def has_character_moved(self, screen_before, screen_after, threshold=1500):
+        diff = cv2.absdiff(screen_before, screen_after)
+        gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+        _, thresh = cv2.threshold(gray_diff, 30, 255, cv2.THRESH_BINARY)
+        changed_pixels = np.count_nonzero(thresh)
+        return changed_pixels > threshold
+
+    def find_all_objects(self, image_path, return_best_score=False):
+        try:
+            if not os.path.exists(image_path):
+                return ([], 0.0) if return_best_score else []
+
+            base_template = cv2.imread(image_path, cv2.IMREAD_COLOR)
+            if base_template is None:
+                return ([], 0.0) if return_best_score else []
+
+            screen_bgr = self.get_screen_bgr()
+            best_max_val = 0.0
+            points = []
+
+            for scale in [1.0, 0.9, 1.1, 0.8, 1.2]:
+                if scale == 1.0:
+                    tpl = base_template
+                else:
+                    new_w = max(8, int(base_template.shape[1] * scale))
+                    new_h = max(8, int(base_template.shape[0] * scale))
+                    tpl = cv2.resize(base_template, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+                h, w = tpl.shape[:2]
+                if h >= screen_bgr.shape[0] or w >= screen_bgr.shape[1]:
+                    continue
+
+                res = cv2.matchTemplate(screen_bgr, tpl, cv2.TM_CCOEFF_NORMED)
+                _, max_val, _, _ = cv2.minMaxLoc(res)
+                if max_val > best_max_val:
+                    best_max_val = max_val
+
+                loc = np.where(res >= self.cfg["CONFIDENCE"])
+                for pt in zip(*loc[::-1]):
+                    cx, cy = int(pt[0] + w // 2), int(pt[1] + h // 2)
+                    if all(abs(cx - px) > 20 or abs(cy - py) > 20 for px, py in points):
+                        points.append((cx, cy))
+
+                if points:
+                    break
+
+            if return_best_score:
+                return points, best_max_val
+            return points
+        except Exception as e:
+            print(f"[Lỗi quét ảnh {image_path}] {e}")
+            return ([], 0.0) if return_best_score else []
+
+    def update_player_position(self):
+        player_img = self.cfg.get("IMG_PLAYER", "player.png")
+        if os.path.exists(player_img):
+            pts = self.find_all_objects(player_img)
+            if pts:
+                self.player_pos = pts[0]
+                return self.player_pos
+
+        if self.player_pos is None:
+            if self.room_center is not None:
+                self.player_pos = self.room_center
+            else:
+                self.auto_refresh_window_rect()
+                l, t, w, h = self.current_rect
+                self.player_pos = (l + w // 2, t + h // 2)
+        return self.player_pos
+
+    def sort_targets_by_closest(self, targets):
+        if not targets:
+            return []
+        px, py = self.update_player_position()
+        return sorted(targets, key=lambda pt: math.hypot(pt[0] - px, pt[1] - py))
+
+    def classify_doors(self):
+        screen_bgr = self.get_screen_bgr()
+        tpl_white = cv2.imread(self.cfg["IMG_DOOR_WHITE"], cv2.IMREAD_COLOR)
+        tpl_grey = cv2.imread(self.cfg["IMG_DOOR_GREY"], cv2.IMREAD_COLOR)
+
+        if tpl_white is None or tpl_grey is None:
+            return [], []
+
+        white_brightness = float(np.mean(tpl_white))
+        grey_brightness = float(np.mean(tpl_grey))
+        mid_brightness = (white_brightness + grey_brightness) / 2.0
+
+        raw_doors = self.find_all_objects(self.cfg["IMG_DOOR_WHITE"])
+        for gd in self.find_all_objects(self.cfg["IMG_DOOR_GREY"]):
+            if all(abs(gd[0] - d[0]) > 25 or abs(gd[1] - d[1]) > 25 for d in raw_doors):
+                raw_doors.append(gd)
+
+        h, w = tpl_white.shape[:2]
+        white_doors, grey_doors = [], []
+
+        for (cx, cy) in raw_doors:
+            y1, y2 = max(0, cy - h // 2), min(screen_bgr.shape[0], cy + h // 2)
+            x1, x2 = max(0, cx - w // 2), min(screen_bgr.shape[1], cx + w // 2)
+            door_patch = screen_bgr[y1:y2, x1:x2]
+            patch_brightness = float(np.mean(door_patch))
+
+            if white_brightness >= grey_brightness:
+                if patch_brightness >= mid_brightness:
+                    white_doors.append((cx, cy))
+                else:
+                    grey_doors.append((cx, cy))
+            else:
+                if patch_brightness <= mid_brightness:
+                    white_doors.append((cx, cy))
+                else:
+                    grey_doors.append((cx, cy))
+
+        return white_doors, grey_doors
+
+    def is_room_map_visible(self):
+        monsters = self.find_all_objects(self.cfg["IMG_MONSTER"])
+        white_doors, grey_doors = self.classify_doors()
+        exit_btn = self.find_all_objects(self.cfg["IMG_EXIT_DUNGEON"])
+        return bool(monsters or white_doors or grey_doors or exit_btn)
+
+    def is_already_in_dungeon(self):
+        if self.is_hp_bar_visible():
+            return True
+        if self.is_room_map_visible():
+            return True
         return False
 
     def handle_post_combat_loot(self):
-        """
-        Sau khi quái chết:
-        - Chờ 1.2s cho hiệu ứng chuyển cảnh kết thúc hoàn toàn.
-        - Kiểm tra 2 lần liên tiếp (cách nhau 0.4s): nếu cả 2 lần đều không thấy bản đồ phòng
-          (tức là bảng Loot thực sự đang che màn hình) thì mới bấm COORD_LOOT_B.
-        """
-        self.sleep(1.2)
-
-        for _ in range(4):
+        self.random_delay(0.7, 1.1)
+        
+        for attempt in range(5):
             self.check_control_state()
+            monsters = self.find_all_objects(self.cfg["IMG_MONSTER"])
+            doors_white, doors_grey = self.classify_doors()
 
-            # Nếu đã thấy cửa hoặc quái trên bản đồ -> Không có bảng Loot, thoát ngay
-            if self.is_room_map_visible():
-                break
+            if monsters or doors_white or doors_grey:
+                if attempt == 0:
+                    print("   [-] Không có bảng rơi đồ. Đã ở màn hình phòng.")
+                else:
+                    print("   [+] Đã nhận đồ tại tọa độ B xong!")
+                return
 
-            # Chờ thêm 0.4s và kiểm tra lại lần 2 để tránh nhầm lúc màn hình đang chớp chuyển cảnh
-            self.sleep(0.4)
-            if self.is_room_map_visible():
-                break
+            print(f"   [$] Không thấy cửa/quái -> Có RƠI ĐỒ (Lần {attempt + 1}) -> Click tọa độ B!")
+            self.safe_click(*self.get_coord("COORD_LOOT_B"))
+            self.random_delay(0.8, 1.3)
 
-            print("    [🎁] Phát hiện bảng Loot đang che màn hình -> Bấm nhặt đồ (COORD_LOOT_B)...")
-            self.click(self.get_coord("COORD_LOOT_B"), delay=0.7)
-
-    def wait_for_room_loaded(self, timeout=6.0):
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            self.check_control_state()
-            if self.is_hp_bar_visible():
-                return True
-
-            if self.is_room_map_visible():
-                self.sleep(0.4)
-                return True
-
-            self.sleep(0.3)
-        return False
     def loot_all_in_boss_room(self):
-        """Dành cho Chế độ 3: Đi mở toàn bộ các biểu tượng loot.png trong phòng Boss"""
-        if not os.path.exists(self.cfg["IMG_LOOT"]):
-            print(f"[!] Không tìm thấy file ảnh {self.cfg['IMG_LOOT']}, bỏ qua bước mở hòm.")
+        loot_img = self.cfg.get("IMG_LOOT", "loot.png")
+        if not os.path.exists(loot_img):
+            print(f"[Cảnh báo] Bạn chưa có file ảnh '{loot_img}' trong thư mục để chạy Chế độ 3!")
             return
 
-        visited_loots = []
+        print("\n[Chế độ 3] Bắt đầu quét và nhặt toàn bộ Loot (loot.png) trong phòng Boss...")
+        visited_empty_loots = []
 
         while True:
             self.check_control_state()
-            screen = self.capture_screen()
-            loots = self.find_all_objects(self.cfg["IMG_LOOT"], screen_bgr=screen)
-            loots = self.sort_by_distance_to_player(loots, screen_bgr=screen)
+            self.wait_for_room_loaded(timeout=4)
 
-            # Lọc bỏ các hòm rỗng đã kiểm tra
-            available_loots = [
-                l for l in loots
-                if not any(math.hypot(l[0] - vx, l[1] - vy) < 25 for (vx, vy) in visited_loots)
+            all_loots = self.find_all_objects(loot_img)
+            loots = [
+                pt for pt in all_loots
+                if all(abs(pt[0] - v[0]) > 25 or abs(pt[1] - v[1]) > 25 for v in visited_empty_loots)
             ]
 
-            if not available_loots:
+            if not loots:
+                print("[Chế độ 3] Đã kiểm tra và nhặt hết toàn bộ Loot trong phòng Boss!")
                 break
 
-            target_loot = available_loots[0]
-            print(f"    [📦] Tiến tới kiểm tra Loot tại {target_loot}...")
-            self.click(target_loot, delay=1.2)
-            self.player_pos = target_loot
+            loots = self.sort_targets_by_closest(loots)
+            target_loot = loots[0]
+            print(f"-> Phát hiện {len(loots)} điểm Loot. Di chuyển tới Loot gần nhất tại {target_loot}...")
 
-            # Kiểm tra xem có bảng nhặt đồ hiện lên che mất cửa không
-            check_screen = self.capture_screen()
-            w_doors, g_doors = self.classify_doors(screen_bgr=check_screen)
-            monsters = self.find_all_objects(self.cfg["IMG_MONSTER"], screen_bgr=check_screen)
+            screen_before = self.get_screen_bgr()
+            self.safe_click(*target_loot)
+            self.random_delay(0.8, 1.2)
 
-            if len(w_doors) == 0 and len(g_doors) == 0 and len(monsters) == 0:
-                print("    [✨] Hòm có đồ! Bấm nhặt tại COORD_LOOT_B...")
-                self.click(self.get_coord("COORD_LOOT_B"), delay=0.6)
+            for _ in range(10):
+                self.check_control_state()
+                monsters = self.find_all_objects(self.cfg["IMG_MONSTER"])
+                doors_w, doors_g = self.classify_doors()
+                
+                if not monsters and not doors_w and not doors_g:
+                    break
+                
+                screen_now = self.get_screen_bgr()
+                if not self.has_character_moved(screen_before, screen_now):
+                    break
+                screen_before = screen_now
+                time.sleep(0.5)
+
+            monsters = self.find_all_objects(self.cfg["IMG_MONSTER"])
+            doors_w, doors_g = self.classify_doors()
+
+            if not monsters and not doors_w and not doors_g:
+                print("   [$] Không thấy cửa/quái -> Xác nhận CÓ LOOT! Click tọa độ B để nhận...")
+                self.handle_post_combat_loot()
+                self.player_pos = target_loot
             else:
-                print("    [💨] Hòm rỗng, đánh dấu bỏ qua.")
-                visited_loots.append(target_loot)
+                print("   [-] Vẫn thấy cửa/quái -> Điểm này không có Loot.")
+                visited_empty_loots.append(target_loot)
+                self.player_pos = target_loot
 
-    def exit_dungeon(self):
-        print("[🚪] Đang bấm Thoát Dungeon (exit_dungeon.png)...")
-        if self.wait_and_click(self.cfg["IMG_EXIT_DUNGEON"], timeout=8, delay=0.8):
-            print("[✓] Đang chờ bảng xác nhận (confirm_yes.png)...")
-            self.wait_and_click(self.cfg["IMG_CONFIRM_YES"], timeout=8, delay=1.2)
-            print("[🎉] Đã thoát Dungeon thành công!")
-        else:
-            print("[!] Không tìm thấy nút Thoát Dungeon!")
-
-    def is_inside_dungeon(self):
-        if self.is_hp_bar_visible():
-            return True
-        screen = self.capture_screen()
-        if self.find_all_objects(self.cfg["IMG_EXIT_DUNGEON"], screen_bgr=screen):
-            return True
-        w_doors, g_doors = self.classify_doors(screen_bgr=screen)
-        if w_doors or g_doors:
-            return True
-        if self.find_all_objects(self.cfg["IMG_MONSTER"], screen_bgr=screen):
-            return True
+    def wait_and_click_image(self, image_path, timeout=10):
+        start_time = time.time()
+        best_score = 0.0
+        while time.time() - start_time < timeout:
+            self.check_control_state()
+            points, score = self.find_all_objects(image_path, return_best_score=True)
+            if score > best_score:
+                best_score = score
+            if points:
+                self.safe_click(*points[0])
+                self.random_delay(0.5, 1.2)
+                return True
+            time.sleep(0.5)
+        print(f"[Timeout] Không tìm thấy '{image_path}' (Độ khớp cao nhất: {best_score:.2f} / Cần: {self.cfg['CONFIDENCE']})")
         return False
 
-    def enter_dungeon(self):
-        # Nếu đang ở sẵn trong Dungeon (ví dụ bấm F9 khởi động lại giữa chừng) thì bỏ qua Bước 1-3
-        if self.is_inside_dungeon():
-            print("[⚡] Phát hiện nhân vật đang ở sẵn trong Dungeon! Bắt đầu dọn phòng ngay...")
-            return True
+    def exit_dungeon_with_confirm(self):
+        print("-> Đang bấm nút Thoát Dungeon...")
+        if self.wait_and_click_image(self.cfg["IMG_EXIT_DUNGEON"], timeout=5):
+            print("-> Chờ Pop-up xác nhận và ấn nút 'Yes'...")
+            if self.wait_and_click_image(self.cfg["IMG_CONFIRM_YES"], timeout=5):
+                print("   [+] Đã ấn 'Yes' thoát khỏi Dungeon thành công!")
+                self.random_delay(1.0, 1.8)
+                return True
+            else:
+                print("   [!] Không tìm thấy nút 'Yes' trên Pop-up!")
+        else:
+            print("   [!] Không tìm thấy nút Thoát Dungeon!")
+        return False
 
-        print("[1] Mở menu Dungeon...")
-        if not self.wait_and_click(self.cfg["IMG_MENU_DUNGEON"], timeout=10, delay=0.8):
-            return False
+    def wait_for_room_loaded(self, timeout=6):
+        print("   [...] Đang chờ phòng tải xong bản đồ...")
+        start_time = time.time()
+        clicked_loot_backup = False
 
-        # Chọn loại Dungeon theo tọa độ đã cấu hình
-        coord_map = {
-            1: "COORD_DUNGEON_NORMAL",
-            2: "COORD_DUNGEON_COOP",
-            3: "COORD_DUNGEON_GANG",
-        }
-        d_coord_key = coord_map.get(self.dungeon_type, "COORD_DUNGEON_NORMAL")
-        print(f"[2] Chọn loại Dungeon ({d_coord_key})...")
-        self.click(self.get_coord(d_coord_key), delay=0.8)
+        while time.time() - start_time < timeout:
+            self.check_control_state()
+            monsters = self.find_all_objects(self.cfg["IMG_MONSTER"])
+            white_doors, grey_doors = self.classify_doors()
+            
+            if monsters or white_doors or grey_doors:
+                time.sleep(0.5)
+                return True
 
-        print("[3] Bấm nút Vào Dungeon (enter_dungeon.png)...")
-        if not self.wait_and_click(self.cfg["IMG_ENTER_DUNGEON"], timeout=10, delay=1.5):
-            return False
+            if (time.time() - start_time > 2.5) and not clicked_loot_backup and not self.is_hp_bar_visible():
+                print("   [!] Chưa thấy cửa/quái, thử click tọa độ B phòng trường hợp còn bảng Rơi Đồ...")
+                self.safe_click(*self.get_coord("COORD_LOOT_B"))
+                clicked_loot_backup = True
 
-        return True
-    def clear_dungeon(self):
-        """Hàm chính khám phá các phòng, bắn quái và xử lý phòng Boss theo Chế độ 1, 2, 3, 4"""
-        self.player_pos = None
-        self.room_center = None
-        self.room_pos = (0, 0)
-        self.last_exit_dir = None
-        self.last_exit_coord = None
-        self.edge_visits = {}
+            time.sleep(0.4)
+        print("   [Cảnh báo] Quá thời gian chờ tải phòng!")
+        return False
 
-        is_boss_room = False
-        blocked_monsters = []
-
-        self.wait_for_room_loaded(timeout=6.0)
-
-        while True:
+    # ==========================================
+    # GIAI ĐOẠN 3 & 4: TIẾP CẬN, ĐÁNH QUÁI & ĐẾM SỐ PHÁT BẮN
+    # ==========================================
+    def combat_loop(self):
+        print("   [⚔] Đang ở màn hình chiến đấu! Bắt đầu xả đạn...")
+        combat_active = True
+        shots_fired = 0
+        
+        while combat_active:
             self.check_control_state()
 
-            # Nếu đang ở sẵn trong màn hình giao chiến thì đánh luôn
-            if self.is_hp_bar_visible():
-                shots = self.combat_loop()
-                blocked_monsters.clear()
-                if is_boss_room and self.mode == 2 and shots > 6:
-                    print("[👑] (Chế độ 2) Đã tiêu diệt Boss (> 6 phát)! Thoát Dungeon ngay...")
-                    self.exit_dungeon()
-                    return
-                self.wait_for_room_loaded(timeout=5.0)
-                continue
+            if not self.is_hp_bar_visible():
+                print(f"   [+] Thanh máu biến mất -> QUÁI ĐÃ CHẾT sau {shots_fired} phát bắn!")
+                combat_active = False
+                break
 
-            screen = self.capture_screen()
-            monsters = self.find_all_objects(self.cfg["IMG_MONSTER"], screen_bgr=screen)
-            white_doors, grey_doors = self.classify_doors(screen_bgr=screen)
+            if not self.is_hp_above_z():
+                z_rgb = pyautogui.pixel(*self.get_coord("COORD_HP_Z"))
+                start_rgb = pyautogui.pixel(*self.get_coord("COORD_HP_START"))
+                print(f"   [Hồi máu] Máu tại Z {z_rgb} khác đầu thanh máu {start_rgb} -> Bấm hồi máu tại A!")
+                self.safe_click(*self.get_coord("COORD_HEAL_A"))
+                self.random_delay(0.5, 0.9)
+
+            shots_fired += 1
+            has_shield = self.check_pixel_color(self.get_coord("COORD_SHIELD"), self.cfg["COLOR_SHIELD"])
+            if has_shield:
+                print(f"   [Bắn phát {shots_fired}] Quái CÓ giáp ảo -> Click súng tọa độ X.")
+                self.safe_click(*self.get_coord("COORD_GUN_X"))
+            else:
+                print(f"   [Bắn phát {shots_fired}] Quái KHÔNG giáp -> Click súng tọa độ Y.")
+                self.safe_click(*self.get_coord("COORD_GUN_Y"))
+
+            self.random_delay(0.8, 1.4)
+
+        self.handle_post_combat_loot()
+        return shots_fired
+
+    def try_engage_and_kill_monster(self, monster_coord):
+        self.check_control_state()
+        print(f"-> Thử tiếp cận quái gần nhất tại ({int(monster_coord[0])}, {int(monster_coord[1])})...")
+        screen_before = self.get_screen_bgr()
+        
+        self.safe_click(*monster_coord)
+        self.random_delay(0.7, 1.0)
+        
+        screen_after = self.get_screen_bgr()
+
+        if not self.is_hp_bar_visible():
+            if not self.has_character_moved(screen_before, screen_after):
+                print("   [!] Nhân vật KHÔNG di chuyển (Quái này bị chặn đường)! Đổi sang quái gần tiếp theo...")
+                return False, 0
+            
+            print("   [...] Nhân vật đang đi tới quái & tải trận, đang chờ vào trận...")
+            entered_combat = False
+            
+            for _ in range(20):
+                self.check_control_state()
+                if self.is_hp_bar_visible():
+                    entered_combat = True
+                    break
+                time.sleep(0.6)
+                
+            if not entered_combat:
+                print("   [!] Đã chờ hết thời gian nhưng chưa thấy Thanh Máu xuất hiện!")
+                return False, 0
+
+        self.player_pos = monster_coord
+        shots = self.combat_loop()
+        return True, shots
+
+    # ==========================================
+    # GIAI ĐOẠN 2 & 5: QUÉT PHÒNG, CHẾ ĐỘ BOSS & QUA CỬA
+    # ==========================================
+    def explore_dungeon(self):
+        in_dungeon = True
+        self.last_exit_dir = None
+        self.last_exit_coord = None
+        self.room_pos = (0, 0)
+        self.edge_visits = {}
+        self.player_pos = None
+        
+        while in_dungeon:
+            self.check_control_state()
+
+            if self.is_hp_bar_visible():
+                print("[*] Phát hiện nhân vật đang ở sẵn trong trận đánh! Tiếp tục chiến đấu...")
+                self.combat_loop()
+
+            self.wait_for_room_loaded(timeout=6)
+            
+            monsters = self.find_all_objects(self.cfg["IMG_MONSTER"])
+            white_doors, grey_doors = self.classify_doors()
+            
+            # Tự động cập nhật Tâm Phòng (Cx, Cy) ngay khi vào phòng để phân biệt 4 hướng cửa
             self.update_room_geometry(white_doors, grey_doors, monsters)
 
-            # Kiểm tra phòng Boss (> 4 quái)
-            if len(monsters) > 4 and not is_boss_room:
+            monster_count = len(monsters)
+            print(f"\n[Phòng {self.room_pos}] Phát hiện {monster_count} quái vật. (Đang chạy Chế độ {self.mode})")
+
+            is_boss_room = False
+            if monster_count > 4:
                 is_boss_room = True
-                print(f"[🔥 BOSS ROOM] Phát hiện {len(monsters)} quái (> 4) -> Đây là PHÒNG BOSS!")
+                print(f"[🔥 PHÒNG BOSS] Phát hiện phòng có {monster_count} quái (> 4 quái)! Áp dụng logic Chế độ {self.mode}.")
 
-            # ----------------------------------------------------
-            # TRƯỜNG HỢP A: CÒN QUÁI TRONG PHÒNG
-            # ----------------------------------------------------
-            if len(monsters) > 0:
-                sorted_monsters = self.sort_by_distance_to_player(monsters, screen_bgr=screen)
+            boss_killed_early_exit = False
 
-                # Lọc những con quái chưa bị đánh dấu kẹt đường/địa hình (bán kính 40px)
-                available_monsters = [
-                    m for m in sorted_monsters
-                    if not any(math.hypot(m[0] - bx, m[1] - by) < 40 for (bx, by) in blocked_monsters)
-                ]
-
-                # Nếu tất cả quái đều đã thử mà vẫn kẹt, giữ lại con vừa kẹt gần nhất để đổi sang con khác
-                if not available_monsters:
-                    if len(blocked_monsters) > 0 and len(sorted_monsters) > 1:
-                        last_blocked = blocked_monsters[-1]
-                        blocked_monsters = [last_blocked]
-                        available_monsters = [
-                            m for m in sorted_monsters
-                            if math.hypot(m[0] - last_blocked[0], m[1] - last_blocked[1]) >= 40
-                        ]
-                    if not available_monsters:
-                        blocked_monsters.clear()
-                        available_monsters = sorted_monsters
-
-                target_monster = available_monsters[0]
-                print(
-                    f"[+] Phòng có {len(monsters)} quái. Tấn công quái gần nhất tại {target_monster}..."
-                )
-
-                screen_prev = screen
-                self.click(target_monster, delay=0.6)
-
-                # Chờ nhân vật chạy tới quái và vào trận
-                entered_combat = False
-                still_count = 0
-
-                for step in range(20):
+            while len(monsters) > 0:
+                self.check_control_state()
+                killed_any = False
+                
+                monsters = self.sort_targets_by_closest(monsters)
+                
+                for idx, m_coord in enumerate(monsters):
                     self.check_control_state()
-                    if self.is_hp_bar_visible():
-                        entered_combat = True
+                    print(f"   -> Ưu tiên quái gần nhất số {idx + 1}/{len(monsters)}")
+                    killed, shots_fired = self.try_engage_and_kill_monster(m_coord)
+                    
+                    if killed:
+                        killed_any = True
+                        if self.mode == 2 and shots_fired > 6:
+                            print(f"\n[🎯 ĐÃ DIỆT BOSS] Quái vừa rồi cần tới {shots_fired} phát bắn (> 6 phát)!")
+                            print("-> Theo Chế độ 2 (Chỉ Kill Boss): Lập tức rút lui khỏi Dungeon ngay!")
+                            boss_killed_early_exit = True
+                        break
+                
+                if boss_killed_early_exit:
+                    break
+
+                if self.is_hp_bar_visible():
+                    print("   [!] Phát hiện đang ở trong trận đánh muộn, tiếp tục chiến đấu...")
+                    shots_fired = self.combat_loop()
+                    killed_any = True
+                    if self.mode == 2 and shots_fired > 6:
+                        print(f"\n[🎯 ĐÃ DIỆT BOSS] Quái vừa rồi cần tới {shots_fired} phát bắn (> 6 phát)!")
+                        boss_killed_early_exit = True
                         break
 
-                    screen_now = self.capture_screen()
-                    if self.has_character_moved(screen_prev, screen_now):
-                        # Nhân vật vẫn đang di chuyển -> reset đếm đứng yên
-                        still_count = 0
-                        screen_prev = screen_now
-                    else:
-                        still_count += 1
-                        # Nếu nhân vật đã dừng lại hẳn (2 nhịp liên tiếp không đổi hình) mà chưa vào trận -> bị kẹt
-                        if still_count >= 2:
-                            break
+                self.wait_for_room_loaded(timeout=5)
+                monsters = self.find_all_objects(self.cfg["IMG_MONSTER"])
+                
+                if not killed_any and len(monsters) > 0:
+                    print("[Cảnh báo] Chưa tiếp cận được quái! Chờ 1s rồi quét lại...")
+                    time.sleep(1.0)
 
-                    self.sleep(0.5)
-                    if self.is_hp_bar_visible():
-                        entered_combat = True
-                        break
-
-                if entered_combat or self.is_hp_bar_visible():
-                    # Đã vào trận thành công -> cập nhật vị trí và xóa danh sách quái kẹt
-                    self.player_pos = target_monster
-                    blocked_monsters.clear()
-                    shots = self.combat_loop()
-
-                    # Nếu ở Chế độ 2 (Chỉ săn Boss > 6 phát bắn) trong phòng Boss
-                    if is_boss_room and self.mode == 2 and shots > 6:
-                        print("[👑] (Chế độ 2) Đã hạ gục Boss (> 6 phát bắn) và nhặt đồ! Thoát Dungeon ngay...")
-                        self.exit_dungeon()
-                        return
-
-                    self.wait_for_room_loaded(timeout=5.0)
-                else:
-                    # Không vào được trận (do kẹt địa hình hoặc bị quái khác chắn) -> Khóa con quái này lại!
-                    print(
-                        f"    [⚠️] Không đi tới được quái tại {target_monster} (kẹt địa hình/bị chắn)! Chuyển sang quái khác..."
-                    )
-                    blocked_monsters.append(target_monster)
-
-                continue
-
-            # ----------------------------------------------------
-            # TRƯỜNG HỢP B: ĐÃ HẾT QUÁI TRONG PHÒNG
-            # ----------------------------------------------------
-            if is_boss_room:
-                if self.mode in (1, 4):
-                    print(f"[🏆] (Chế độ {self.mode}) Đã dọn sạch phòng Boss! Tiến hành thoát Dungeon...")
-                    self.exit_dungeon()
-                    return
-                elif self.mode == 3:
-                    print("[🏆] (Chế độ 3) Đã dọn sạch quái phòng Boss! Bắt đầu đi mở toàn bộ Loot...")
-                    self.loot_all_in_boss_room()
-                    print("[🏆] (Chế độ 3) Đã mở xong toàn bộ Loot! Tiến hành thoát Dungeon...")
-                    self.exit_dungeon()
-                    return
-                elif self.mode == 2:
-                    print("[🏆] (Chế độ 2) Đã dọn sạch phòng Boss! Tiến hành thoát Dungeon...")
-                    self.exit_dungeon()
-                    return
-
-            # ----------------------------------------------------
-            # TRƯỜNG HỢP C: PHÒNG THƯỜNG ĐÃ SẠCH QUÁI -> ĐI QUA CỬA
-            # ----------------------------------------------------
-            if len(white_doors) > 0:
-                white_doors = self.sort_by_distance_to_player(white_doors, screen_bgr=screen)
-                chosen_door = white_doors[0]
-                d_dir = self.get_door_direction(chosen_door)
-                print(f"[➡️] Đi qua CỬA TRẮNG ({d_dir}) tại {chosen_door}...")
-                self.record_door_transition(chosen_door)
-                self.click(chosen_door, delay=1.0)
-                is_boss_room = False
-                blocked_monsters.clear()
-                self.wait_for_room_loaded(timeout=6.0)
-
-            elif len(grey_doors) > 0:
-                chosen_door = self.choose_best_grey_door(grey_doors)
-                d_dir = self.get_door_direction(chosen_door)
-                print(f"[↩️] Không còn cửa trắng. Đi qua CỬA XÁM ({d_dir}) tại {chosen_door}...")
-                self.record_door_transition(chosen_door)
-                self.click(chosen_door, delay=1.0)
-                is_boss_room = False
-                blocked_monsters.clear()
-                self.wait_for_room_loaded(timeout=6.0)
-
-            else:
-                print("[?] Không thấy quái và cũng không thấy cửa, chờ 1s rồi quét lại...")
-                self.sleep(1.0)
-    # Bí danh để tương thích nếu bạn gọi explore_and_clear_dungeon
-    def explore_and_clear_dungeon(self):
-        return self.clear_dungeon()
-
-    # ==========================================
-    # VÒNG LẶP CHÍNH (CHẠY NHIỀU LƯỢT)
-    # ==========================================
-    def run(self):
-        self.select_mode()
-        print("=================================================================")
-        print(" PHÍM NÓNG HỖ TRỢ TRONG KHI CHẠY:")
-        print("  • [F1] : Chọn lại Loại Dungeon & Chế độ (1/2/3/4) ở lượt kế tiếp")
-        print("  • [F2] : Khóa / Đồng bộ tỷ lệ khung cửa sổ game hiện tại")
-        print("  • [F8] : Tạm dừng / Tiếp tục Bot (để tự giải mini-game)")
-        print("  • [F9] : Khởi động lại chu trình Bot ngay lập tức")
-        print("=================================================================")
-        print("[*] Bot sẽ bắt đầu sau 3 giây... Hãy chuyển sang cửa sổ game!")
-        time.sleep(3)
-
-        run_count = 0
-        while run_count < self.cfg["MAX_RUNS"]:
-            try:
-                if self.reselect_mode_next_run:
-                    self.select_mode()
-
-                print(f"\n================ BẮT ĐẦU LƯỢT {run_count + 1} / {self.cfg['MAX_RUNS']} ================")
-                if self.enter_dungeon():
-                    self.clear_dungeon()
-                    run_count += 1
-                else:
-                    print("[!] Không thể vào Dungeon, thử lại sau 3 giây...")
-                    self.sleep(3)
-
-            except RestartBotException:
-                print("[🔄] Đã nhận lệnh F9! Bắt đầu lại chu trình mới...")
-                continue
-            except KeyboardInterrupt:
-                print("\n[!] Đã dừng Bot theo yêu cầu người dùng (Ctrl+C).")
+            if boss_killed_early_exit:
+                self.exit_dungeon_with_confirm()
+                in_dungeon = False
                 break
+
+            print(f"[Phòng {self.room_pos}] Đã clear hết quái trong phòng!")
+
+            if is_boss_room:
+                if self.mode == 3:
+                    self.loot_all_in_boss_room()
+                
+                print(f"-> Hoàn thành nhiệm vụ Phòng Boss (Chế độ {self.mode}). Thực hiện thoát Dungeon...")
+                self.exit_dungeon_with_confirm()
+                in_dungeon = False
+                break
+
+            # Quét lại cửa sau khi đã dọn sạch quái
+            white_doors, grey_doors = self.classify_doors()
+            self.update_room_geometry(white_doors, grey_doors, [])
+            print(f"[Quét Cửa] Tìm thấy: {len(white_doors)} Cửa Trắng | {len(grey_doors)} Cửa Xám.")
+
+            # ƯU TIÊN 1: Còn Cửa Trắng là BẮT BUỘC đi Cửa Trắng (Ưu tiên cửa trắng gần nhân vật nhất)
+            if white_doors:
+                white_doors = self.sort_targets_by_closest(white_doors)
+                chosen_white = white_doors[0]
+                out_dir = self.record_door_transition(chosen_white)
+                print(f"-> Đi vào CỬA TRẮNG hướng [{out_dir}] tại {chosen_white} (Sang phòng {self.room_pos})...")
+                self.safe_click(*chosen_white)
+                self.random_delay(1.2, 2.0)
+                continue
+
+            # ƯU TIÊN 2: Hết Cửa Trắng -> Chọn Cửa Xám (Né CỬA ĐỐI DIỆN vừa bước ra)
+            if grey_doors:
+                chosen_grey = self.choose_best_grey_door(grey_doors)
+                out_dir = self.record_door_transition(chosen_grey)
+                print(f"-> Hết cửa trắng. Đi vào CỬA XÁM hướng [{out_dir}] tại {chosen_grey} (Sang phòng {self.room_pos})...")
+                self.safe_click(*chosen_grey)
+                self.random_delay(1.2, 2.0)
+                continue
+
+            print("-> Không còn cửa nào trên màn hình. Thoát hoặc hoàn thành Dungeon!")
+            self.exit_dungeon_with_confirm()
+            in_dungeon = False
+
+    def start(self):
+        print("=== BẮT ĐẦU AUTO DUNGEON CYBERCODE ONLINE ===")
+        print("💡 Phím [F1]: Chọn lại Loại Dungeon & Chế độ (1/2/3) ở lượt kế tiếp.")
+        print("💡 Phím [F2]: Khóa Tỉ Lệ Cửa Sổ Game / Đồng bộ khi dời cửa sổ game.")
+        print("💡 Phím [F8]: TẠM DỪNG / TIẾP TỤC (Để giải Mini-game).")
+        print("💡 Phím [F9]: RESTART AUTO ngay lập tức.")
+        print("💡 Hất mạnh chuột về góc trên bên trái màn hình để DỪNG HẲN.")
+
+        self.select_mode()
+
+        try:
+            while self.run_count < self.cfg["MAX_RUNS"]:
+                try:
+                    self.restart_requested = False
+                    self.check_control_state()
+
+                    if self.reselect_mode_next_run:
+                        self.select_mode()
+
+                    if self.is_already_in_dungeon():
+                        print("\n========================================================")
+                        print(f"[*] Phát hiện ĐANG Ở SẴN TRONG DUNGEON! (Chế độ {self.mode})")
+                        print("-> Bắt đầu dọn phòng ngay lập tức...")
+                        print("========================================================")
+                        self.explore_dungeon()
+                        self.random_delay(1.5, 3.0)
+                        continue
+
+                    self.run_count += 1
+                    print(f"\n================ LƯỢT DUNGEON {self.run_count}/{self.cfg['MAX_RUNS']} (CHẾ ĐỘ {self.mode}) ================")
+
+                    if not self.wait_and_click_image(self.cfg["IMG_MENU_DUNGEON"], timeout=5):
+                        if self.is_already_in_dungeon():
+                            continue
+                        time.sleep(2)
+                        continue
+
+                    if not self.click_selected_dungeon_type():
+                        continue
+
+                    if not self.wait_and_click_image(self.cfg["IMG_ENTER_DUNGEON"]):
+                        continue
+
+                    self.explore_dungeon()
+                    self.random_delay(1.5, 3.0)
+
+                except RestartBotException:
+                    print("[🔄] Đã nhận lệnh Restart (F9)! Đang kiểm tra lại màn hình hiện tại...")
+                    if self.reselect_mode_next_run:
+                        self.select_mode()
+                    time.sleep(1.0)
+                    continue
+
+            print("\n=== ĐÃ HOÀN THÀNH ĐỦ SỐ LƯỢT CHẠY! ===")
+        except pyautogui.FailSafeException:
+            print("\n[DỪNG KHẨN CẤP] Đã ngắt Bot an toàn.")
+        except KeyboardInterrupt:
+            print("\n[DỪNG] Người dùng nhấn Ctrl+C.")
 
 
 if __name__ == "__main__":
     bot = CyberCodeDungeonBot(CONFIG)
-    bot.run()
+    bot.start()
