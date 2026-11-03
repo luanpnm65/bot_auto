@@ -420,17 +420,18 @@ class CyberCodeDungeonBot:
         print("\n========================================================")
         print("        BƯỚC B: CHỌN CHẾ ĐỘ ĐÁNH PHÒNG BOSS (1 / 2 / 3) ")
         print("========================================================")
-        print(" [1] Chế độ 1: Clear sạch quái phòng Boss (> 4 quái) rồi thoát.")
+        print(" [1] Chế độ 1: Clear sạch quái phòng Boss (>= 5 quái) rồi thoát.")
         print(" [2] Chế độ 2: Chỉ Kill Boss (Quái bắn > 6 phát mới chết) rồi thoát ngay.")
         print(" [3] Chế độ 3: Clear sạch quái phòng Boss + Loot hết đồ (loot.png) rồi thoát.")
+        print(" [4] Chế độ 4: FARM NHANH - Chỉ bắn súng Y (bỏ qua giáp ảo & hồi máu), clear phòng Boss rồi thoát.")
         print("========================================================")
         while True:
-            m_choice = input("-> Nhập Chế độ đánh Boss (1, 2 hoặc 3) rồi nhấn Enter: ").strip()
-            if m_choice in ["1", "2", "3"]:
+            m_choice = input("-> Nhập Chế độ đánh Boss (1, 2, 3 hoặc 4) rồi nhấn Enter: ").strip()
+            if m_choice in ["1", "2", "3", "4"]:
                 self.mode = int(m_choice)
                 self.reselect_mode_next_run = False
                 break
-            print("   [!] Vui lòng chỉ nhập 1, 2 hoặc 3.")
+            print("   [!] Vui lòng chỉ nhập 1, 2, 3 hoặc 4.")
 
         dungeon_names = {1: "NORMAL", 2: "CO-OP", 3: "GANG"}
         print(f"\n[✔] Đã chọn: Dungeon [{dungeon_names[self.dungeon_type]}] - Chế độ Boss [{self.mode}]!")
@@ -803,7 +804,7 @@ class CyberCodeDungeonBot:
                 combat_active = False
                 break
 
-            if not self.is_hp_above_z():
+            if self.mode != 4 and not self.is_hp_above_z():
                 z_rgb = pyautogui.pixel(*self.get_coord("COORD_HP_Z"))
                 start_rgb = pyautogui.pixel(*self.get_coord("COORD_HP_START"))
                 print(f"   [Hồi máu] Máu tại Z {z_rgb} khác đầu thanh máu {start_rgb} -> Bấm hồi máu tại A!")
@@ -811,6 +812,12 @@ class CyberCodeDungeonBot:
                 self.random_delay(0.5, 0.9)
 
             shots_fired += 1
+            if self.mode == 4:
+                print(f"   [Bắn phát {shots_fired}] [Chế độ 4 - Farm nhanh] Luôn click súng tọa độ Y.")
+                self.safe_click(*self.get_coord("COORD_GUN_Y"))
+                self.random_delay(0.8, 1.4)
+                continue
+
             has_shield = self.check_pixel_color(self.get_coord("COORD_SHIELD"), self.cfg["COLOR_SHIELD"])
             if has_shield:
                 print(f"   [Bắn phát {shots_fired}] Quái CÓ giáp ảo -> Click súng tọa độ X.")
@@ -821,6 +828,8 @@ class CyberCodeDungeonBot:
 
             self.random_delay(0.8, 1.4)
 
+        # Chờ thêm 0.3s sau khi quái chết rồi mới xét xem có rơi loot không
+        self.random_delay(0.3, 0.3)
         self.handle_post_combat_loot()
         return shots_fired
 
@@ -887,9 +896,9 @@ class CyberCodeDungeonBot:
             print(f"\n[Phòng {self.room_pos}] Phát hiện {monster_count} quái vật. (Đang chạy Chế độ {self.mode})")
 
             is_boss_room = False
-            if monster_count > 4:
+            if monster_count >= 5:
                 is_boss_room = True
-                print(f"[🔥 PHÒNG BOSS] Phát hiện phòng có {monster_count} quái (> 4 quái)! Áp dụng logic Chế độ {self.mode}.")
+                print(f"[🔥 PHÒNG BOSS] Phát hiện phòng có {monster_count} quái (>= 5 quái)! Áp dụng logic Chế độ {self.mode}.")
 
             boss_killed_early_exit = False
 
